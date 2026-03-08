@@ -29,9 +29,7 @@ def load_dataframe(csv_file: str, sequence_column: str, label_column: str) -> tu
 def build_sequence_dataset(
     df: pd.DataFrame,
     seq_col: str,
-    lab_col: str,
-    max_len: int | None = None,
-    pad_value: float = 0.0
+    lab_col: str
 ):
     feature_cols = [c for c in df.columns if c not in [seq_col, lab_col]]
     if not feature_cols:
@@ -53,22 +51,43 @@ def build_sequence_dataset(
     if len(x_list) == 0:
         raise ValueError("No sequences found.")
 
-    if max_len is None:
-        max_len = max(len(x) for x in x_list)
+    y = np.asarray(y_list, dtype=np.float32).reshape(-1, 1)
 
     n_seq = len(x_list)
     n_feat = x_list[0].shape[1]
-    X = np.full((n_seq, max_len, n_feat), pad_value, dtype=np.float32)
+    max_len_found = max(len(x) for x in x_list)
 
+    print(f"Sequences: {n_seq}, Features: {n_feat}, Max length (raw): {max_len_found}")
+    print(f"Label distribution: {np.unique(y, return_counts=True)}")
+    return x_list, y
+
+
+def scale_sequence_lists(x_train_list, x_test_list):
+    scaler = StandardScaler()
+
+    # fit only on real timesteps from training sequences (before padding)
+    train_concat = np.concatenate(x_train_list, axis=0)
+    scaler.fit(train_concat)
+
+    x_train_scaled = [scaler.transform(x).astype(np.float32) for x in x_train_list]
+    x_test_scaled = [scaler.transform(x).astype(np.float32) for x in x_test_list]
+    return x_train_scaled, x_test_scaled
+
+
+def pad_sequence_list(x_list, max_len=None, pad_value=0.0):
+    if len(x_list) == 0:
+        raise ValueError("Cannot pad an empty sequence list.")
+
+    n_feat = x_list[0].shape[1]
+    if max_len is None:
+        max_len = max(len(x) for x in x_list)
+
+    X = np.full((len(x_list), max_len, n_feat), pad_value, dtype=np.float32)
     for i, x in enumerate(x_list):
         L = min(len(x), max_len)
         X[i, :L, :] = x[:L, :]
 
-    y = np.asarray(y_list, dtype=np.float32).reshape(-1, 1)
-
-    print(f"Sequences: {n_seq}, Features: {n_feat}, Max length: {max_len}")
-    print(f"Label distribution: {np.unique(y, return_counts=True)}")
-    return X, y, max_len
+    return X, max_len
 
 
 def create_model(input_shape, lstm_units=128):
@@ -87,19 +106,6 @@ def create_model(input_shape, lstm_units=128):
     return keras.Model(inputs, outputs)
 
 
-def scale_3d(X_train, X_test):
-    n_feat = X_train.shape[2]
-    scaler = StandardScaler()
-
-    Xtr2 = X_train.reshape(-1, n_feat)
-    Xte2 = X_test.reshape(-1, n_feat)
-
-    Xtr2 = scaler.fit_transform(Xtr2)
-    Xte2 = scaler.transform(Xte2)
-
-    return Xtr2.reshape(X_train.shape), Xte2.reshape(X_test.shape)
-
-
 def main(
     csv_file: str,
     sequence_column: str = "Sequence_Number",
@@ -112,16 +118,47 @@ def main(
     epochs: int = 10
 ):
     df, seq_col, lab_col = load_dataframe(csv_file, sequence_column, label_column)
-    X, y, used_max_len = build_sequence_dataset(df, seq_col, lab_col, max_len=max_len)
+    x_list, y = build_sequence_dataset(df, seq_col, lab_col)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
+    # split as list-of-sequences (variable length), not padded yet
+    idx = np.arange(len(x_list))
+
+    # safe stratify: only if each class has at least 2 samples
+    y_flat = y.ravel().astype(int)
+    unique, counts = np.unique(y_flat, return_counts=True)
+    can_stratify = (len(unique) > 1) and np.all(counts >= 2)
+
+    stratify_arg = y_flat if can_stratify else None
+    if not can_stratify:
+        print(
+            f"Warning: stratified split disabled. Class counts={dict(zip(unique.tolist(), counts.tolist()))}. "
+            "Need >=2 samples per class."
+        )
+
+    train_idx, test_idx = train_test_split(
+        idx,
         test_size=test_size,
         random_state=random_state,
-        stratify=y.ravel() if len(np.unique(y)) > 1 else None
+        stratify=stratify_arg
     )
 
-    X_train, X_test = scale_3d(X_train, X_test)
+    x_train_list = [x_list[i] for i in train_idx]
+    x_test_list = [x_list[i] for i in test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    # scale BEFORE padding
+    x_train_list, x_test_list = scale_sequence_lists(x_train_list, x_test_list)
+
+    # choose max_len (global unless provided)
+    used_max_len = max_len if max_len is not None else max(
+        max(len(x) for x in x_train_list),
+        max(len(x) for x in x_test_list)
+    )
+
+    # pad AFTER scaling with 0.0 so Masking(mask_value=0.0) works
+    X_train, _ = pad_sequence_list(x_train_list, max_len=used_max_len, pad_value=0.0)
+    X_test, _ = pad_sequence_list(x_test_list, max_len=used_max_len, pad_value=0.0)
 
     model = create_model((used_max_len, X_train.shape[2]), lstm_units=lstm_units)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
