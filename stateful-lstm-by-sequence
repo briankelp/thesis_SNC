@@ -5,6 +5,8 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+import os
+import pickle
 
 
 def _normalize_col(s: str) -> str:
@@ -59,7 +61,7 @@ def build_sequence_dataset(
 
     print(f"Sequences: {n_seq}, Features: {n_feat}, Max length (raw): {max_len_found}")
     print(f"Label distribution: {np.unique(y, return_counts=True)}")
-    return x_list, y
+    return x_list, y, feature_cols
 
 
 def scale_sequence_lists(x_train_list, x_test_list):
@@ -71,7 +73,7 @@ def scale_sequence_lists(x_train_list, x_test_list):
 
     x_train_scaled = [scaler.transform(x).astype(np.float32) for x in x_train_list]
     x_test_scaled = [scaler.transform(x).astype(np.float32) for x in x_test_list]
-    return x_train_scaled, x_test_scaled
+    return x_train_scaled, x_test_scaled, scaler
 
 
 def pad_sequence_list(x_list, max_len=None, pad_value=0.0):
@@ -115,10 +117,11 @@ def main(
     test_size: float = 0.2,
     random_state: int = 42,
     batch_size: int = 32,
-    epochs: int = 10
+    epochs: int = 10,
+    save_dir: str = "artifacts"
 ):
     df, seq_col, lab_col = load_dataframe(csv_file, sequence_column, label_column)
-    x_list, y = build_sequence_dataset(df, seq_col, lab_col)
+    x_list, y, feature_cols = build_sequence_dataset(df, seq_col, lab_col)
 
     # split as list-of-sequences (variable length), not padded yet
     idx = np.arange(len(x_list))
@@ -148,7 +151,7 @@ def main(
     y_test = y[test_idx]
 
     # scale BEFORE padding
-    x_train_list, x_test_list = scale_sequence_lists(x_train_list, x_test_list)
+    x_train_list, x_test_list, scaler = scale_sequence_lists(x_train_list, x_test_list)
 
     # choose max_len (global unless provided)
     used_max_len = max_len if max_len is not None else max(
@@ -173,16 +176,96 @@ def main(
     loss, acc = model.evaluate(X_test, y_test, batch_size=batch_size)
     print(f"Test Loss: {loss:.4f}, Test Accuracy: {acc:.4f}")
 
+    save_artifacts(model, scaler, feature_cols, used_max_len, out_dir=save_dir)
+
+
+def save_artifacts(model, scaler, feature_cols, max_len, out_dir="artifacts"):
+    os.makedirs(out_dir, exist_ok=True)
+    model.save(os.path.join(out_dir, "sequence_model.keras"))
+    with open(os.path.join(out_dir, "preprocess.pkl"), "wb") as f:
+        pickle.dump(
+            {"scaler": scaler, "feature_cols": feature_cols, "max_len": int(max_len)},
+            f
+        )
+    print(f"Saved artifacts to: {out_dir}")
+
+
+def load_artifacts(artifacts_dir="artifacts"):
+    model = keras.models.load_model(os.path.join(artifacts_dir, "sequence_model.keras"))
+    with open(os.path.join(artifacts_dir, "preprocess.pkl"), "rb") as f:
+        meta = pickle.load(f)
+    return model, meta
+
+
+def _resolve_many_columns(df: pd.DataFrame, expected_cols: list[str]) -> list[str]:
+    resolved = []
+    for c in expected_cols:
+        resolved.append(_resolve_column(df, c))
+    return resolved
+
+
+def predict_csv(input_csv: str, artifacts_dir="artifacts", sequence_column="Sequence_Number", threshold=0.5):
+    model, meta = load_artifacts(artifacts_dir)
+    scaler = meta["scaler"]
+    feature_cols = meta["feature_cols"]
+    max_len = meta["max_len"]
+
+    df = pd.read_csv(input_csv)
+    resolved_feature_cols = _resolve_many_columns(df, feature_cols)
+
+    # if sequence column exists -> predict per sequence; else treat whole file as 1 sequence
+    try:
+        seq_col = _resolve_column(df, sequence_column)
+        groups = [g for _, g in df.groupby(seq_col, sort=False)]
+    except ValueError:
+        groups = [df]
+
+    x_list = []
+    for g in groups:
+        x = g[resolved_feature_cols].apply(pd.to_numeric, errors="coerce").fillna(-1).to_numpy(dtype=np.float32)
+        x = scaler.transform(x).astype(np.float32)
+        x_list.append(x)
+
+    X, _ = pad_sequence_list(x_list, max_len=max_len, pad_value=0.0)
+    probs = model.predict(X, verbose=0).ravel()
+    preds = (probs >= threshold).astype(int)
+
+    out = pd.DataFrame({
+        "sequence_index": np.arange(len(probs)),
+        "probability": probs,
+        "prediction": preds
+    })
+    print(out.to_string(index=False))
+
 
 if __name__ == "__main__":
-    # usage:
-    # python stateful-lstm-w-attn.py <csv_path> [sequence_column] [label_column]
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <csv_path> [Sequence_Number] [label]")
+    # train:
+    #   python stateful-lstm-by-sequence train <train_csv> [Sequence_Number] [label] [artifacts_dir]
+    # infer:
+    #   python stateful-lstm-by-sequence infer <input_csv> [artifacts_dir] [Sequence_Number]
+    if len(sys.argv) < 3:
+        print(
+            f"Usage:\n"
+            f"  {sys.argv[0]} train <train_csv> [Sequence_Number] [label] [artifacts_dir]\n"
+            f"  {sys.argv[0]} infer <input_csv> [artifacts_dir] [Sequence_Number]"
+        )
         sys.exit(1)
 
-    csv_path = sys.argv[1]
-    seq_col = sys.argv[2] if len(sys.argv) > 2 else "Sequence_Number"
-    lab_col = sys.argv[3] if len(sys.argv) > 3 else "label"
+    mode = sys.argv[1].lower()
 
-    main(csv_path, sequence_column=seq_col, label_column=lab_col)
+    if mode == "train":
+        csv_path = sys.argv[2]
+        seq_col = sys.argv[3] if len(sys.argv) > 3 else "Sequence_Number"
+        lab_col = sys.argv[4] if len(sys.argv) > 4 else "label"
+        out_dir = sys.argv[5] if len(sys.argv) > 5 else "artifacts"
+        main(csv_path, sequence_column=seq_col, label_column=lab_col, save_dir=out_dir)
+
+    elif mode == "infer":
+        input_csv = sys.argv[2]
+        artifacts_dir = sys.argv[3] if len(sys.argv) > 3 else "artifacts"
+        seq_col = sys.argv[4] if len(sys.argv) > 4 else "Sequence_Number"
+        predict_csv(input_csv, artifacts_dir=artifacts_dir, sequence_column=seq_col)
+
+    else:
+        print("First argument must be 'train' or 'infer'.")
+        sys.exit(1)
