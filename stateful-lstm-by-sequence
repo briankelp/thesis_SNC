@@ -204,25 +204,64 @@ def _resolve_many_columns(df: pd.DataFrame, expected_cols: list[str]) -> list[st
     return resolved
 
 
+def _align_features_to_training_schema(
+    df: pd.DataFrame,
+    expected_cols: list[str],
+    fill_value: float = -1.0
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    # Normalize input names once
+    norm_map = {_normalize_col(c): c for c in df.columns}
+    expected_norm = [_normalize_col(c) for c in expected_cols]
+
+    # Build a rename map for matched columns only
+    rename_map = {}
+    missing = []
+    for exp, exp_n in zip(expected_cols, expected_norm):
+        if exp_n in norm_map:
+            rename_map[norm_map[exp_n]] = exp
+        else:
+            missing.append(exp)
+
+    # Rename + one-shot reindex avoids fragmentation warnings
+    aligned = (
+        df.rename(columns=rename_map)
+          .reindex(columns=expected_cols, fill_value=fill_value)
+    )
+
+    expected_set = set(expected_norm)
+    extra = [c for c in df.columns if _normalize_col(c) not in expected_set]
+    return aligned, missing, extra
+
+
 def predict_csv(input_csv: str, artifacts_dir="artifacts", sequence_column="Sequence_Number", threshold=0.5):
     model, meta = load_artifacts(artifacts_dir)
     scaler = meta["scaler"]
     feature_cols = meta["feature_cols"]
     max_len = meta["max_len"]
 
-    df = pd.read_csv(input_csv)
-    resolved_feature_cols = _resolve_many_columns(df, feature_cols)
+    df_raw = pd.read_csv(input_csv)
+
+    # Align once to training schema: missing -> fill, extra -> ignored
+    aligned_df, missing_cols, extra_cols = _align_features_to_training_schema(
+        df_raw, feature_cols, fill_value=-1.0
+    )
+
+    if missing_cols:
+        print(f"Warning: {len(missing_cols)} trained features missing in input; filled with -1.")
+    if extra_cols:
+        print(f"Info: {len(extra_cols)} extra input columns ignored.")
 
     # if sequence column exists -> predict per sequence; else treat whole file as 1 sequence
     try:
-        seq_col = _resolve_column(df, sequence_column)
-        groups = [g for _, g in df.groupby(seq_col, sort=False)]
+        seq_col = _resolve_column(df_raw, sequence_column)
+        groups = [idx for _, idx in df_raw.groupby(seq_col, sort=False).groups.items()]
     except ValueError:
-        groups = [df]
+        groups = [df_raw.index]
 
     x_list = []
-    for g in groups:
-        x = g[resolved_feature_cols].apply(pd.to_numeric, errors="coerce").fillna(-1).to_numpy(dtype=np.float32)
+    for idx in groups:
+        g = aligned_df.loc[idx, feature_cols]
+        x = g.apply(pd.to_numeric, errors="coerce").fillna(-1).to_numpy(dtype=np.float32)
         x = scaler.transform(x).astype(np.float32)
         x_list.append(x)
 
