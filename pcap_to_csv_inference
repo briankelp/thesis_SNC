@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import pickle
+import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+
+# -------------------------
+# XML field extraction
+# -------------------------
+
+def _safe_name(raw: Optional[str], empty_name: str) -> str:
+    if raw is None or raw == "":
+        return empty_name
+    return raw.replace(".", "_")
+
+
+def get_nested_field_names(field_element: ET.Element) -> List[str]:
+    nested_field_names: List[str] = []
+    for nested_field in field_element.findall("field"):
+        field_name = _safe_name(nested_field.get("name"), "nested_empty_field_name")
+        nested_field_names.extend([
+            f"{field_name}_name",
+            f"{field_name}_showname",
+            f"{field_name}_size",
+            f"{field_name}_pos",
+            f"{field_name}_show",
+            f"{field_name}_value",
+        ])
+        nested_field_names.extend(get_nested_field_names(nested_field))
+    return nested_field_names
+
+
+def get_packet_field_names(proto: ET.Element) -> List[str]:
+    packet_fields: List[str] = []
+    for field in proto.findall("field"):
+        field_name = _safe_name(field.get("name"), "empty_field_name")
+        packet_fields.extend([
+            f"{field_name}_name",
+            f"{field_name}_showname",
+            f"{field_name}_size",
+            f"{field_name}_pos",
+            f"{field_name}_show",
+            f"{field_name}_value",
+        ])
+        packet_fields.extend(get_nested_field_names(field))
+    return packet_fields
+
+
+def get_nested_fields(field_element: ET.Element) -> List[Optional[str]]:
+    nested_fields: List[Optional[str]] = []
+    for nested_field in field_element.findall("field"):
+        nested_fields.extend([
+            nested_field.get("name"),
+            nested_field.get("showname"),
+            nested_field.get("size"),
+            nested_field.get("pos"),
+            nested_field.get("show"),
+            nested_field.get("value"),
+        ])
+        nested_fields.extend(get_nested_fields(nested_field))
+    return nested_fields
+
+
+def align_lists(target_cols: List[str], cols: List[str], values: List[Optional[str]]) -> List[Optional[str]]:
+    # Keeps first occurrence behavior from your notebook logic.
+    first_idx: Dict[str, int] = {}
+    for i, c in enumerate(cols):
+        if c not in first_idx:
+            first_idx[c] = i
+    out: List[Optional[str]] = []
+    for c in target_cols:
+        if c in first_idx:
+            out.append(values[first_idx[c]])
+        else:
+            out.append("")
+    return out
+
+
+def iter_rrc_protos(packet: ET.Element):
+    # 1) top-level nr-rrc
+    for proto in packet.findall("proto"):
+        if proto.get("name") == "nr-rrc" and proto.get("hide") != "yes":
+            yield proto
+
+    # 2) nr-rrc nested under mac-nr
+    for top_proto in packet.findall("proto"):
+        if top_proto.get("name") == "mac-nr":
+            for proto in top_proto.iter("proto"):
+                if proto.get("name") == "nr-rrc" and proto.get("hide") != "yes":
+                    yield proto
+
+
+def extract_columns_and_values_from_xml(xml_file: str) -> Tuple[List[str], List[List[Optional[str]]]]:
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+    packets = root.findall("packet")
+
+    # Pass 1: collect union schema
+    column_names: set[str] = set()
+    for packet in packets:
+        for rrc_proto in iter_rrc_protos(packet):
+            column_names.update(get_packet_field_names(rrc_proto))
+            for nas_proto in rrc_proto.iter("proto"):
+                if nas_proto.get("name") == "nas-5gs":
+                    column_names.update(get_packet_field_names(nas_proto))
+
+    ordered_columns = sorted(column_names)
+
+    # Pass 2: extract aligned rows
+    rows: List[List[Optional[str]]] = []
+    for packet in packets:
+        for rrc_proto in iter_rrc_protos(packet):
+            packet_fields: List[Optional[str]] = []
+            cols: List[str] = []
+
+            for field in rrc_proto.findall("field"):
+                packet_fields.extend([
+                    field.get("name"),
+                    field.get("showname"),
+                    field.get("size"),
+                    field.get("pos"),
+                    field.get("show"),
+                    field.get("value"),
+                ])
+                packet_fields.extend(get_nested_fields(field))
+            cols.extend(get_packet_field_names(rrc_proto))
+
+            for nas_proto in rrc_proto.iter("proto"):
+                if nas_proto.get("name") == "nas-5gs":
+                    for field in nas_proto.findall("field"):
+                        packet_fields.extend([
+                            field.get("name"),
+                            field.get("showname"),
+                            field.get("size"),
+                            field.get("pos"),
+                            field.get("show"),
+                            field.get("value"),
+                        ])
+                        packet_fields.extend(get_nested_fields(field))
+                    cols.extend(get_packet_field_names(nas_proto))
+
+            rows.append(align_lists(ordered_columns, cols, packet_fields))
+
+    return ordered_columns, rows
+
+
+# -------------------------
+# Conversion and dataframe
+# -------------------------
+
+def run_tshark_to_pdml(input_pcap: str, xml_output_file: str) -> None:
+    with open(xml_output_file, "w", encoding="utf-8") as f:
+        subprocess.run(["tshark", "-r", input_pcap, "-T", "pdml"], stdout=f, check=True)
+
+
+def prepare_dataframe_from_xml(xml_file: str) -> pd.DataFrame:
+    columns, values = extract_columns_and_values_from_xml(xml_file)
+    return pd.DataFrame(values, columns=columns)
+
+
+# -------------------------
+# Encoding
+# -------------------------
+
+def _encode_features_locally(
+    df: pd.DataFrame,
+    protected_cols: Tuple[str, ...] = ("Sequence_Number",),
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, int]]]:
+    out = df.copy()
+    feat_cols = [c for c in out.columns if c not in protected_cols]
+    out[feat_cols] = out[feat_cols].replace(r"^\s*$", np.nan, regex=True)
+
+    category_maps: Dict[str, Dict[str, int]] = {}
+    for col in feat_cols:
+        s = out[col].astype("string")
+        uniques = sorted([str(v) for v in s.dropna().unique().tolist()])
+        mapping = {v: i for i, v in enumerate(uniques)}
+        out[col] = s.map(mapping).fillna(-1).astype(np.float32)
+        category_maps[col] = mapping
+
+    return out, category_maps
+
+
+def _encode_features_trained(df: pd.DataFrame, artifacts_dir: str) -> pd.DataFrame:
+    enc_path = os.path.join(artifacts_dir, "feature_encoding.pkl")
+    if not os.path.exists(enc_path):
+        raise FileNotFoundError(f"Missing trained encoding file: {enc_path}")
+
+    with open(enc_path, "rb") as f:
+        enc = pickle.load(f)
+
+    feature_cols = enc["feature_cols"]
+    category_maps = enc["category_maps"]
+
+    aligned = df.reindex(columns=feature_cols)
+    for col in feature_cols:
+        cmap = category_maps.get(col, None)
+        if cmap is not None:
+            aligned[col] = aligned[col].astype("string").map(cmap).fillna(-1).astype(np.float32)
+        else:
+            aligned[col] = pd.to_numeric(aligned[col], errors="coerce").fillna(-1).astype(np.float32)
+
+    return pd.concat([df[["Sequence_Number"]], aligned], axis=1)
+
+
+# -------------------------
+# Unified pipeline
+# -------------------------
+
+def pcap_or_xml_to_infer_csv(
+    output_csv: str = "csv_files/infer_input.csv",
+    pcap_file: Optional[str] = None,
+    xml_file: Optional[str] = None,
+    artifacts_dir: str = "artifacts",
+    encoding_mode: str = "local",  # "local" | "trained"
+    sequence_number: int = 1,
+    keep_generated_xml: bool = False,
+) -> str:
+    if (pcap_file is None and xml_file is None) or (pcap_file and xml_file):
+        raise ValueError("Provide exactly one of pcap_file or xml_file.")
+
+    generated_xml = None
+    src_xml = xml_file
+
+    if pcap_file:
+        os.makedirs("xml_files_to_be_infered", exist_ok=True)
+        base = os.path.splitext(os.path.basename(pcap_file))[0]
+        generated_xml = os.path.join("xml_files_to_be_infered", f"{base}.xml")
+        run_tshark_to_pdml(pcap_file, generated_xml)
+        src_xml = generated_xml
+
+    assert src_xml is not None
+    df_inf = prepare_dataframe_from_xml(src_xml)
+    if df_inf.empty:
+        raise ValueError(f"No rows extracted from XML: {src_xml}")
+
+    df_inf["Sequence_Number"] = int(sequence_number)
+    df_inf = df_inf.loc[:, ~df_inf.columns.str.match(r"(?i)^unnamed")]
+
+    if encoding_mode == "trained":
+        out_df = _encode_features_trained(df_inf, artifacts_dir=artifacts_dir)
+    elif encoding_mode == "local":
+        out_df, local_maps = _encode_features_locally(df_inf, protected_cols=("Sequence_Number",))
+        os.makedirs(artifacts_dir, exist_ok=True)
+        with open(os.path.join(artifacts_dir, "feature_encoding_infer_local.pkl"), "wb") as f:
+            pickle.dump(
+                {
+                    "feature_cols": [c for c in out_df.columns if c != "Sequence_Number"],
+                    "category_maps": local_maps,
+                },
+                f,
+            )
+    else:
+        raise ValueError("encoding_mode must be 'local' or 'trained'")
+
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+    out_df.to_csv(output_csv, index=False)
+
+    if generated_xml and not keep_generated_xml and os.path.exists(generated_xml):
+        os.remove(generated_xml)
+
+    return output_csv
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Unified PCAP/XML -> inference CSV pipeline")
+    parser.add_argument("--pcap", type=str, default=None, help="Input PCAP file")
+    parser.add_argument("--xml", type=str, default=None, help="Input XML (PDML) file")
+    parser.add_argument("--output-csv", type=str, default="csv_files/infer_input.csv")
+    parser.add_argument("--artifacts-dir", type=str, default="artifacts")
+    parser.add_argument("--encoding-mode", type=str, choices=["local", "trained"], default="local")
+    parser.add_argument("--sequence-number", type=int, default=1)
+    parser.add_argument("--keep-generated-xml", action="store_true")
+    args = parser.parse_args()
+
+    out = pcap_or_xml_to_infer_csv(
+        output_csv=args.output_csv,
+        pcap_file=args.pcap,
+        xml_file=args.xml,
+        artifacts_dir=args.artifacts_dir,
+        encoding_mode=args.encoding_mode,
+        sequence_number=args.sequence_number,
+        keep_generated_xml=args.keep_generated_xml,
+    )
+    print(f"Saved inference CSV: {out}")
+
+
+if __name__ == "__main__":
+    main()
