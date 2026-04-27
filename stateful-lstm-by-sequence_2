@@ -8,6 +8,62 @@ from sklearn.preprocessing import StandardScaler
 import os
 import pickle
 
+from sklearn.metrics import confusion_matrix, classification_report
+
+def evaluate_model(model, X_test, y_test, batch_size=32, threshold=0.5):
+    # Get raw probabilities from model
+    probs = model.predict(X_test, batch_size=batch_size).ravel()
+    preds = (probs >= threshold).astype(int)
+    y_true = y_test.ravel().astype(int)
+
+    # Confusion matrix → extract TP, TN, FP, FN
+    tn, fp, fn, tp = confusion_matrix(y_true, preds).ravel()
+
+    print(f"TP={tp}, TN={tn}, FP={fp}, FN={fn}")
+
+    # ── Accuracy ──────────────────────────────────────
+    # Acc = (TP + TN) / (TP + TN + FP + FN)
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+
+    # ── Precision ─────────────────────────────────────
+    # P = TP / (TP + FP)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+    # ── Recall / TPR ──────────────────────────────────
+    # R = TP / (TP + FN)
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+    # ── False Positive Rate ───────────────────────────
+    # FPR = FP / (TN + FP)
+    fpr = fp / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    # ── F1 Score ──────────────────────────────────────
+    # F1 = 2 * (P * R) / (P + R)
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    # ── Print Results ─────────────────────────────────
+    print("\n========== Evaluation Results ==========")
+    print(f"Accuracy  (Acc) = (TP+TN)/(TP+TN+FP+FN) = ({tp}+{tn})/({tp}+{tn}+{fp}+{fn}) = {accuracy:.4f}")
+    print(f"Precision (P)   = TP/(TP+FP)             = {tp}/({tp}+{fp})  = {precision:.4f}")
+    print(f"Recall    (R)   = TP/(TP+FN)             = {tp}/({tp}+{fn})  = {recall:.4f}")
+    print(f"FPR             = FP/(TN+FP)             = {fp}/({tn}+{fp})  = {fpr:.4f}")
+    print(f"F1-Score        = 2*(P*R)/(P+R)          = 2*({precision:.4f}*{recall:.4f})/({precision:.4f}+{recall:.4f}) = {f1:.4f}")
+    print("=========================================\n")
+
+    # ── Confusion Matrix Display ───────────────────────
+    print("Confusion Matrix:")
+    print(f"                 Predicted Benign  Predicted Attack")
+    print(f"Actual Benign       {tn:<18} {fp}")
+    print(f"Actual Attack       {fn:<18} {tp}")
+
+    return {
+        "TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn),
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "fpr": fpr,
+        "f1": f1
+    }
 
 def _normalize_col(s: str) -> str:
     return s.strip().lower().replace(" ", "_")
@@ -96,13 +152,17 @@ def create_model(input_shape, lstm_units=128):
     inputs = keras.Input(shape=input_shape)
     x = layers.Masking(mask_value=0.0)(inputs)
 
-    H = layers.LSTM(lstm_units, return_sequences=True)(x)
+    H = layers.LSTM(lstm_units, return_sequences=True,
+                    dropout=0.3,            # ← ADD: drops input connections
+                    recurrent_dropout=0.2   # ← ADD: drops recurrent connections
+                    )(x)
     context_seq = layers.Attention()([H, H])
     context_vec = layers.GlobalAveragePooling1D()(context_seq)
     h_pool = layers.GlobalMaxPooling1D()(H)
 
     combined = layers.Concatenate(axis=-1)([context_vec, h_pool])
     z = layers.Dense(lstm_units, activation="tanh")(combined)
+    z = layers.Dropout(0.3)(z)             # ← ADD: drops dense layer connections
     outputs = layers.Dense(1, activation="sigmoid")(z)
 
     return keras.Model(inputs, outputs)
@@ -117,7 +177,7 @@ def main(
     test_size: float = 0.2,
     random_state: int = 42,
     batch_size: int = 32,
-    epochs: int = 10,
+    epochs: int = 100,
     save_dir: str = "artifacts_2"
 ):
     df, seq_col, lab_col = load_dataframe(csv_file, sequence_column, label_column)
@@ -166,15 +226,25 @@ def main(
     model = create_model((used_max_len, X_train.shape[2]), lstm_units=lstm_units)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
 
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=10,
+            restore_best_weights=True
+        )
+    ]
+
     model.fit(
         X_train, y_train,
         epochs=epochs,
         batch_size=batch_size,
-        validation_data=(X_test, y_test)
+        validation_data=(X_test, y_test),
+        callbacks=callbacks
     )
 
     loss, acc = model.evaluate(X_test, y_test, batch_size=batch_size)
     print(f"Test Loss: {loss:.4f}, Test Accuracy: {acc:.4f}")
+    metrics = evaluate_model(model, X_test, y_test, batch_size=batch_size)
 
     save_artifacts(model, scaler, feature_cols, used_max_len, out_dir=save_dir)
 
