@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-
 import argparse
 import os
 import pickle
 import subprocess
 import tempfile
+import time
+from datetime import datetime
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
+from tensorflow import keras
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+warnings.filterwarnings("ignore")
 
 
 # -------------------------
@@ -70,7 +76,6 @@ def get_nested_fields(field_element: ET.Element) -> List[Optional[str]]:
 
 
 def align_lists(target_cols: List[str], cols: List[str], values: List[Optional[str]]) -> List[Optional[str]]:
-    # Keeps first occurrence behavior from your notebook logic.
     first_idx: Dict[str, int] = {}
     for i, c in enumerate(cols):
         if c not in first_idx:
@@ -153,7 +158,7 @@ def extract_columns_and_values_from_xml(xml_file: str) -> Tuple[List[str], List[
 
 
 # -------------------------
-# Conversion and dataframe
+# PDML conversion
 # -------------------------
 
 def run_tshark_to_pdml(input_pcap: str, xml_output_file: str) -> None:
@@ -167,130 +172,173 @@ def prepare_dataframe_from_xml(xml_file: str) -> pd.DataFrame:
 
 
 # -------------------------
-# Encoding
+# Encoding + padding
 # -------------------------
 
-def _encode_features_locally(
-    df: pd.DataFrame,
-    protected_cols: Tuple[str, ...] = ("Sequence_Number",),
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, int]]]:
+def encode_dataframe(df: pd.DataFrame, category_maps: Dict[str, Dict[str, int]]) -> pd.DataFrame:
     out = df.copy()
-    feat_cols = [c for c in out.columns if c not in protected_cols]
-    out[feat_cols] = out[feat_cols].replace(r"^\s*$", np.nan, regex=True)
-
-    category_maps: Dict[str, Dict[str, int]] = {}
-    for col in feat_cols:
-        s = out[col].astype("string")
-        uniques = sorted([str(v) for v in s.dropna().unique().tolist()])
-        mapping = {v: i for i, v in enumerate(uniques)}
-        out[col] = s.map(mapping).fillna(-1).astype(np.float32)
-        category_maps[col] = mapping
-
-    return out, category_maps
+    for col in out.columns:
+        cmap = category_maps.get(col)
+        if cmap is not None:
+            cmap_str = {str(k): int(v) for k, v in cmap.items()}
+            s = out[col].astype("string")
+            out[col] = s.map(cmap_str).fillna(-1).astype(np.float32)
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(-1).astype(np.float32)
+    return out
 
 
-def _encode_features_trained(df: pd.DataFrame, artifacts_dir: str) -> pd.DataFrame:
-    enc_path = os.path.join(artifacts_dir, "feature_encoding.pkl")
-    if not os.path.exists(enc_path):
-        raise FileNotFoundError(f"Missing trained encoding file: {enc_path}")
+def pad_sequence_list(x_list: List[np.ndarray], max_len: int, pad_value: float = 0.0) -> Tuple[np.ndarray, int]:
+    if len(x_list) == 0:
+        raise ValueError("Cannot pad an empty sequence list.")
+    n_feat = x_list[0].shape[1]
+    X = np.full((len(x_list), max_len, n_feat), pad_value, dtype=np.float32)
+    for i, x in enumerate(x_list):
+        L = min(len(x), max_len)
+        if L > 0:
+            X[i, :L, :] = x[:L, :]
+    return X, max_len
 
-    with open(enc_path, "rb") as f:
+
+# -------------------------
+# Artifacts
+# -------------------------
+
+def load_artifacts(artifacts_dir: str):
+    model_path = os.path.join(artifacts_dir, "sequence_model.keras")
+    preproc_path = os.path.join(artifacts_dir, "preprocess.pkl")
+    encoding_path = os.path.join(artifacts_dir, "feature_encoding.pkl")
+
+    model = keras.models.load_model(model_path, compile=False)
+
+    with open(preproc_path, "rb") as f:
+        meta = pickle.load(f)
+
+    with open(encoding_path, "rb") as f:
         enc = pickle.load(f)
 
-    feature_cols = enc["feature_cols"]
-    category_maps = enc["category_maps"]
+    category_maps = enc["category_maps"] if isinstance(enc, dict) and "category_maps" in enc else enc
+    scaler = meta["scaler"]
+    feature_cols = meta["feature_cols"]
+    max_len = int(meta["max_len"])
 
-    aligned = df.reindex(columns=feature_cols)
-    for col in feature_cols:
-        cmap = category_maps.get(col, None)
-        if cmap is not None:
-            aligned[col] = aligned[col].astype("string").map(cmap).fillna(-1).astype(np.float32)
-        else:
-            aligned[col] = pd.to_numeric(aligned[col], errors="coerce").fillna(-1).astype(np.float32)
-
-    return pd.concat([df[["Sequence_Number"]], aligned], axis=1)
+    return model, scaler, feature_cols, max_len, category_maps
 
 
 # -------------------------
-# Unified pipeline
+# Inference
 # -------------------------
 
-def     pcap_or_xml_to_infer_csv(
-    output_csv: str = "csv_files/infer_input.csv",
-    pcap_file: Optional[str] = None,
-    xml_file: Optional[str] = None,
-    artifacts_dir: str = "artifacts",
-    encoding_mode: str = "local",  # "local" | "trained"
-    sequence_number: int = 1,
-    keep_generated_xml: bool = False,
-) -> str:
-    if (pcap_file is None and xml_file is None) or (pcap_file and xml_file):
-        raise ValueError("Provide exactly one of pcap_file or xml_file.")
+def infer_once(
+    pcap_path: str,
+    model,
+    scaler,
+    feature_cols: List[str],
+    max_len: int,
+    category_maps: Dict[str, Dict[str, int]],
+    threshold: float
+) -> Tuple[Optional[float], Optional[int]]:
+    xml_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-8") as tmp:
+            xml_path = tmp.name
 
-    generated_xml = None
-    src_xml = xml_file
+        run_tshark_to_pdml(pcap_path, xml_path)
+        df = prepare_dataframe_from_xml(xml_path)
 
-    if pcap_file:
-        os.makedirs("xml_files_to_be_infered", exist_ok=True)
-        base = os.path.splitext(os.path.basename(pcap_file))[0]
-        generated_xml = os.path.join("xml_files_to_be_infered", f"{base}.xml")
-        run_tshark_to_pdml(pcap_file, generated_xml)
-        src_xml = generated_xml
+    finally:
+        if xml_path and os.path.exists(xml_path):
+            os.remove(xml_path)
 
-    assert src_xml is not None
-    df_inf = prepare_dataframe_from_xml(src_xml)
-    if df_inf.empty:
-        raise ValueError(f"No rows extracted from XML: {src_xml}")
+    if df.empty or df.shape[0] == 0:
+        return None, None
 
-    df_inf["Sequence_Number"] = int(sequence_number)
-    df_inf = df_inf.loc[:, ~df_inf.columns.str.match(r"(?i)^unnamed")]
+    # Encode strings
+    df = encode_dataframe(df, category_maps)
 
-    if encoding_mode == "trained":
-        out_df = _encode_features_trained(df_inf, artifacts_dir=artifacts_dir)
-    elif encoding_mode == "local":
-        out_df, local_maps = _encode_features_locally(df_inf, protected_cols=("Sequence_Number",))
-        os.makedirs(artifacts_dir, exist_ok=True)
-        with open(os.path.join(artifacts_dir, "feature_encoding_infer_local.pkl"), "wb") as f:
-            pickle.dump(
-                {
-                    "feature_cols": [c for c in out_df.columns if c != "Sequence_Number"],
-                    "category_maps": local_maps,
-                },
-                f,
-            )
-    else:
-        raise ValueError("encoding_mode must be 'local' or 'trained'")
+    # Deduplicate columns
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
-    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
-    out_df.to_csv(output_csv, index=False)
+    # Align to training schema
+    df = df.reindex(columns=feature_cols, fill_value=-1.0)
 
-    if generated_xml and not keep_generated_xml and os.path.exists(generated_xml):
-        os.remove(generated_xml)
+    x = df.apply(pd.to_numeric, errors="coerce").fillna(-1).to_numpy(dtype=np.float32)
+    if x.shape[0] == 0:
+        return None, None
 
-    return output_csv
+    x = scaler.transform(x).astype(np.float32)
+    X, _ = pad_sequence_list([x], max_len=max_len, pad_value=0.0)
 
+    probs = model.predict(X, verbose=0).ravel()
+    prob = float(probs[0])
+    pred = int(prob >= threshold)
+    return prob, pred
+
+
+# -------------------------
+# Main loop
+# -------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified PCAP/XML -> inference CSV pipeline")
-    parser.add_argument("--pcap", type=str, default=None, help="Input PCAP file")
-    parser.add_argument("--xml", type=str, default=None, help="Input XML (PDML) file")
-    parser.add_argument("--output-csv", type=str, default="csv_files/infer_input.csv")
-    parser.add_argument("--artifacts-dir", type=str, default="artifacts")
-    parser.add_argument("--encoding-mode", type=str, choices=["local", "trained"], default="local")
-    parser.add_argument("--sequence-number", type=int, default=1)
-    parser.add_argument("--keep-generated-xml", action="store_true")
+    parser = argparse.ArgumentParser(description="Live NR-RRC detection from a growing pcap")
+    parser.add_argument("--artifacts-dir", type=str, default="artifacts_2/")
+    parser.add_argument("--interval", type=float, default=5.0)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--pcap", type=str, default="/tmp/ue_mac_nr.pcap")
     args = parser.parse_args()
 
-    out = pcap_or_xml_to_infer_csv(
-        output_csv=args.output_csv,
-        pcap_file=args.pcap,
-        xml_file=args.xml,
-        artifacts_dir=args.artifacts_dir,
-        encoding_mode=args.encoding_mode,
-        sequence_number=args.sequence_number,
-        keep_generated_xml=args.keep_generated_xml,
-    )
-    print(f"Saved inference CSV: {out}")
+    model, scaler, feature_cols, max_len, category_maps = load_artifacts(args.artifacts_dir)
+
+    attacks_detected = 0
+
+    try:
+        while True:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if (not os.path.exists(args.pcap)) or (os.path.getsize(args.pcap) == 0):
+                print(f"[{ts}] Waiting for pcap file to appear or receive data...")
+                time.sleep(args.interval)
+                continue
+
+            try:
+                prob, pred = infer_once(
+                    pcap_path=args.pcap,
+                    model=model,
+                    scaler=scaler,
+                    feature_cols=feature_cols,
+                    max_len=max_len,
+                    category_maps=category_maps,
+                    threshold=args.threshold
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"[{ts}] Warning: tshark failed ({e}). Retrying...")
+                time.sleep(args.interval)
+                continue
+            except ET.ParseError as e:
+                print(f"[{ts}] Warning: PDML parse failed ({e}). Retrying...")
+                time.sleep(args.interval)
+                continue
+            except Exception as e:
+                print(f"[{ts}] Warning: inference failed ({e}). Retrying...")
+                time.sleep(args.interval)
+                continue
+
+            if prob is None or pred is None:
+                print(f"[{ts}] Warning: No NR-RRC packets found. Skipping iteration.")
+                time.sleep(args.interval)
+                continue
+
+            if pred == 1:
+                attacks_detected += 1
+                label = "⚠️  FBS ATTACK DETECTED"
+            else:
+                label = "✅  BENIGN"
+
+            print(f"[{ts}] Probability: {prob:.4f} | Prediction: {label}")
+            time.sleep(args.interval)
+
+    except KeyboardInterrupt:
+        print(f"\nExiting. Attacks detected: {attacks_detected}")
 
 
 if __name__ == "__main__":
