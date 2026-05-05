@@ -255,42 +255,44 @@ def infer_once(
     max_len: int,
     category_maps: Dict[str, Dict[str, int]],
     threshold: float
-) -> Tuple[Optional[float], Optional[int]]:
+) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[int]]:
+    # ↑ add two more return values: elapsed_time, packet_count
+
     xml_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-8") as tmp:
             xml_path = tmp.name
-
         run_tshark_to_pdml(pcap_path, xml_path)
         df = prepare_dataframe_from_xml(xml_path)
-
     finally:
         if xml_path and os.path.exists(xml_path):
             os.remove(xml_path)
 
     if df.empty or df.shape[0] == 0:
-        return None, None
+        return None, None, None, None
 
-    # Encode strings
+    packet_count = len(df)   # ← how many packets were in the pcap
+
     df = encode_dataframe(df, category_maps)
-
-    # Deduplicate columns
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
-    # Align to training schema
     df = df.reindex(columns=feature_cols, fill_value=-1.0)
 
     x = df.apply(pd.to_numeric, errors="coerce").fillna(-1).to_numpy(dtype=np.float32)
     if x.shape[0] == 0:
-        return None, None
+        return None, None, None, None
 
     x = scaler.transform(x).astype(np.float32)
     X, _ = pad_sequence_list([x], max_len=max_len, pad_value=0.0)
 
+    # ── Timer wraps only the model.predict() call ──────────────────────────
+    t_start = time.perf_counter()
     probs = model.predict(X, verbose=0).ravel()
+    t_end = time.perf_counter()
+    elapsed_ms = (t_end - t_start) * 1000   # convert to milliseconds
+
     prob = float(probs[0])
     pred = int(prob >= threshold)
-    return prob, pred
+    return prob, pred, elapsed_ms, packet_count
 
 
 # -------------------------
@@ -300,26 +302,30 @@ def infer_once(
 def main():
     parser = argparse.ArgumentParser(description="Live NR-RRC detection from a growing pcap")
     parser.add_argument("--artifacts-dir", type=str, default="artifacts_2/")
-    parser.add_argument("--interval", type=float, default=5.0)
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--pcap", type=str, default="/tmp/ue_mac_nr.pcap")
+    parser.add_argument("--interval",      type=float, default=5.0)
+    parser.add_argument("--threshold",     type=float, default=0.5)
+    parser.add_argument("--pcap",          type=str, default="/tmp/ue_mac_nr.pcap")
     args = parser.parse_args()
 
     model, scaler, feature_cols, max_len, category_maps = load_artifacts(args.artifacts_dir)
 
-    attacks_detected = 0
+    # ── Runtime stats ──────────────────────────────────────────────────────
+    attacks_detected  = 0
+    benign_detected   = 0
+    inference_count   = 0
+    total_elapsed_ms  = 0.0
 
     try:
         while True:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if (not os.path.exists(args.pcap)) or (os.path.getsize(args.pcap) == 0):
-                print(f"[{ts}] Waiting for pcap file to appear or receive data...")
+                print(f"[{ts}] Waiting for pcap file...")
                 time.sleep(args.interval)
                 continue
 
             try:
-                prob, pred = infer_once(
+                prob, pred, elapsed_ms, packet_count = infer_once(
                     pcap_path=args.pcap,
                     model=model,
                     scaler=scaler,
@@ -342,21 +348,47 @@ def main():
                 continue
 
             if prob is None or pred is None:
-                print(f"[{ts}] Warning: No NR-RRC packets found. Skipping iteration.")
+                print(f"[{ts}] Warning: No NR-RRC packets found. Skipping.")
                 time.sleep(args.interval)
                 continue
+
+            # ── Update stats ───────────────────────────────────────────────
+            inference_count  += 1
+            total_elapsed_ms += elapsed_ms
+            avg_elapsed_ms    = total_elapsed_ms / inference_count
 
             if pred == 1:
                 attacks_detected += 1
                 label = "⚠️  FBS ATTACK DETECTED"
             else:
+                benign_detected += 1
                 label = "✅  BENIGN"
 
-            print(f"[{ts}] Probability: {prob:.4f} | Prediction: {label}")
+            # ── Print result line ──────────────────────────────────────────
+            print(
+                f"[{ts}] "
+                f"{label} | "
+                f"Prob: {prob:.4f} | "
+                f"Packets: {packet_count} | "
+                f"Predict time: {elapsed_ms:.1f}ms | "
+                f"Avg: {avg_elapsed_ms:.1f}ms | "
+                f"Runs: {inference_count} "
+                f"(✅{benign_detected} ⚠️{attacks_detected})"
+            )
+
             time.sleep(args.interval)
 
     except KeyboardInterrupt:
-        print(f"\nExiting. Attacks detected: {attacks_detected}")
+        print(f"\n{'='*55}")
+        print(f"  Session Summary")
+        print(f"{'='*55}")
+        print(f"  Total inferences:    {inference_count}")
+        print(f"  Benign detections:   {benign_detected}")
+        print(f"  Attack detections:   {attacks_detected}")
+        if inference_count > 0:
+            print(f"  Avg predict time:    {total_elapsed_ms / inference_count:.1f} ms")
+            print(f"  Total predict time:  {total_elapsed_ms:.1f} ms")
+        print(f"{'='*55}\n")
 
 
 if __name__ == "__main__":
