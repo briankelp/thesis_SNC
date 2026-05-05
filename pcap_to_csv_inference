@@ -189,6 +189,36 @@ def _encode_features_locally(
     return out, category_maps
 
 
+def encode_dataframe(df, category_maps):
+    out = df.copy()
+    for col in out.columns:
+        cmap = category_maps.get(col)
+        if cmap is None:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(-1).astype(np.float32)
+            continue
+        if isinstance(cmap, dict) and cmap.get("__type__") == "fbs_binary":
+            primary_causes = set(cmap.get("__primary__", []))
+
+            def encode_cause(val):
+                try:
+                    cause = int(float(str(val)))
+                    if cause in primary_causes:
+                        return 30
+                    elif cause > 0:
+                        return 0
+                    else:
+                        return -1
+                except (ValueError, TypeError):
+                    return -1
+
+            out[col] = out[col].apply(encode_cause).astype(np.float32)
+        else:
+            cmap_str = {str(k): int(v) for k, v in cmap.items()
+                        if not str(k).startswith("__")}
+            s = out[col].astype("string")
+            out[col] = s.map(cmap_str).fillna(-1).astype(np.float32)
+    return out
+
 def _encode_features_trained(df: pd.DataFrame, artifacts_dir: str) -> pd.DataFrame:
     enc_path = os.path.join(artifacts_dir, "feature_encoding.pkl")
     if not os.path.exists(enc_path):
@@ -201,12 +231,7 @@ def _encode_features_trained(df: pd.DataFrame, artifacts_dir: str) -> pd.DataFra
     category_maps = enc["category_maps"]
 
     aligned = df.reindex(columns=feature_cols)
-    for col in feature_cols:
-        cmap = category_maps.get(col, None)
-        if cmap is not None:
-            aligned[col] = aligned[col].astype("string").map(cmap).fillna(-1).astype(np.float32)
-        else:
-            aligned[col] = pd.to_numeric(aligned[col], errors="coerce").fillna(-1).astype(np.float32)
+    aligned = encode_dataframe(aligned, category_maps)
 
     return pd.concat([df[["Sequence_Number"]], aligned], axis=1)
 

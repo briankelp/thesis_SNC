@@ -179,12 +179,30 @@ def encode_dataframe(df: pd.DataFrame, category_maps: Dict[str, Dict[str, int]])
     out = df.copy()
     for col in out.columns:
         cmap = category_maps.get(col)
-        if cmap is not None:
-            cmap_str = {str(k): int(v) for k, v in cmap.items()}
+        if cmap is None:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(-1).astype(np.float32)
+            continue
+        if isinstance(cmap, dict) and cmap.get("__type__") == "fbs_binary":
+            primary_causes = set(cmap.get("__primary__", []))
+
+            def encode_cause(val):
+                try:
+                    cause = int(float(str(val)))
+                    if cause in primary_causes:
+                        return 30
+                    elif cause > 0:
+                        return 0
+                    else:
+                        return -1
+                except (ValueError, TypeError):
+                    return -1
+
+            out[col] = out[col].apply(encode_cause).astype(np.float32)
+        else:
+            cmap_str = {str(k): int(v) for k, v in cmap.items()
+                        if not str(k).startswith("__")}
             s = out[col].astype("string")
             out[col] = s.map(cmap_str).fillna(-1).astype(np.float32)
-        else:
-            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(-1).astype(np.float32)
     return out
 
 
